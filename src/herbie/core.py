@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 import warnings
 from datetime import datetime, timedelta
@@ -923,7 +924,8 @@ class Herbie:
 
             idx_df["download_groups"] = idx_df.grib_message.diff().ne(1).cumsum()
 
-            # cURL subsets of each group
+            # Collect curl commands for each group
+            curl_cmds = []
             for i, curl_group in idx_df.groupby("download_groups"):
                 if verbose:
                     print(f"Download subset group {i}")
@@ -939,23 +941,23 @@ class Herbie:
                 )
 
                 if curl_group.end_byte.max() - curl_group.start_byte.min() < 0:
-                    # The byte range for GRIB submessages (like in the
-                    # RAP model's UGRD/VGRD) need to be handled differently.
-                    # See https://github.com/blaylockbk/Herbie/issues/259
                     if verbose:
                         print(f"  ERROR: Invalid cURL range {range}; Skip message.")
                     continue
 
-                if i == 1:
-                    # If we are working on the first item, overwrite the existing file...
-                    curl = f'''curl -s --range {range} "{grib_source}" > "{outFile}"'''
-                else:
-                    # ...all other messages are appended to the subset file.
-                    curl = f'''curl -s --range {range} "{grib_source}" >> "{outFile}"'''
+                curl_cmds.append(["curl", "-s", "--range", range, grib_source])
 
+            def fetch(cmd):
                 if verbose:
-                    print(curl)
-                os.system(curl)
+                    print(" ".join(cmd))
+                return subprocess.run(cmd, capture_output=True).stdout
+
+            with ThreadPoolExecutor(max_workers=min(len(curl_cmds), 10)) as exe:
+                results = list(exe.map(fetch, curl_cmds))
+
+            with open(outFile, "wb") as f:
+                for data in results:
+                    f.write(data)
 
             if verbose:
                 print(f"💾 Saved the subset to {outFile}")
