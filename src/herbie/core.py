@@ -253,8 +253,8 @@ class Herbie:
         # Ok, now we are ready to look for the GRIB2 file at each of the remote sources.
         # self.grib is the first existing GRIB2 file discovered.
         # self.idx is the first existing index file discovered.
-        self.grib, self.grib_source = self.find_grib()
-        self.idx, self.idx_source = self.find_idx()
+        self.grib, self.idx, self.grib_source = self.find_grib()
+        self.idx_source = self.grib_source
 
         if verbose:
             # ANSI colors added for style points
@@ -368,72 +368,64 @@ class Herbie:
             print("🤝🏻⛔ Bad handshake with pando? Am I able to move on?")
             pass
 
-    def _check_grib(self, url: str, min_content_length: int = 10) -> bool:
-        """
-        Check that the GRIB2 URL exist and is of useful length.
+    def _check_grib(
+        self, url: str, min_content_length: int = 10, verbose: bool = False
+    ) -> tuple[bool, Optional[str]]:
+        """Check if a GRIB2 file and its index exist.
 
-        Parameters
-        ----------
-        url : str
-            Full URL path to the GRIB file
-        min_content_length : int
-            The HTTP header content-length in bytes.
-            Used to check a file is of useful size. This was once set to
-            1_000_000 (1 MB), but there was an issue with NOMADS not
-            providing this right (see #114). I decreased to 10 and
-            essentially turned off this check.
+        This performs HEAD requests for the GRIB file and all possible
+        index file suffixes concurrently and returns the first existing
+        index file that is found.
         """
-        head = requests.head(url)
-        check_exists = head.ok
-        if check_exists and "Content-Length" in head.raw.info():
-            check_content = int(head.raw.info()["Content-Length"]) > min_content_length
-            return check_exists and check_content
-        else:
-            return False
 
-    def _check_idx(self, url: str, verbose: bool = False) -> tuple[bool, Optional[str]]:
-        """Check if an index file exist for the GRIB2 URL."""
-        # To check inventory files with slightly different URL structure
-        # we will loop through the IDX_SUFFIX.
+        def _head(u: str):
+            try:
+                return requests.head(u)
+            except Exception:
+                return None
+
+        idx_urls = (
+            [url.rsplit(".", maxsplit=1)[0] + suf for suf in self.IDX_SUFFIX]
+            if Path(url).suffix in {".grb", ".grib", ".grb2", ".grib2"}
+            else [url + suf for suf in self.IDX_SUFFIX]
+        )
+
+        urls = [url] + idx_urls
+        with ThreadPoolExecutor() as ex:
+            responses = list(ex.map(_head, urls))
+
+        head = responses[0]
+        grib_exists = bool(head and head.ok)
+        if grib_exists and "Content-Length" in head.raw.info():
+            grib_exists = int(head.raw.info()["Content-Length"]) > min_content_length
+
+        idx_url_found = None
+        for u, r in zip(idx_urls, responses[1:]):
+            if r and r.ok:
+                idx_url_found = u
+                break
 
         if verbose:
-            print(f"🐜 {self.IDX_SUFFIX=}")
+            print(f"🐜 checked {url}, grib_exists={grib_exists}, idx={idx_url_found}")
 
-        # Loop through IDX_SUFFIX options until we find one that exists
-        for i in self.IDX_SUFFIX:
-            if Path(url).suffix in {".grb", ".grib", ".grb2", ".grib2"}:
-                idx_url = url.rsplit(".", maxsplit=1)[0] + i
-            else:
-                idx_url = url + i
+        return grib_exists, idx_url_found
 
-            idx_exists = requests.head(idx_url).ok
-            if verbose:
-                print(f"🐜 {idx_url=}")
-                print(f"🐜 {idx_exists=}")
-            if idx_exists:
-                return idx_exists, idx_url
+    def find_grib(
+        self,
+    ) -> tuple[
+        Optional[Union[Path, str]], Optional[Union[Path, str]], Optional[str]
+    ]:
+        """Find a GRIB file and its index from the archive sources."""
 
-        if verbose:
-            print(
-                "⚠ Herbie didn't find any inventory files that",
-                f"exists from {self.IDX_SUFFIX}",
-            )
-        return False, None
-
-    def find_grib(self) -> tuple[Optional[Union[Path, str]], Optional[str]]:
-        """Find a GRIB file from the archive sources.
-
-        Returns
-        -------
-        1) The URL or pathlib.Path to the GRIB2 files that exists
-        2) The source of the GRIB2 file
-        """
-        # But first, check if the GRIB2 file exists locally.
         local_grib = self.get_localFilePath()
         if local_grib.exists() and not self.overwrite:
-            return local_grib, "local"
-            # NOTE: We will still get the idx files from a remote
-            #       because they aren't stored locally, or are they?   # TODO: If the idx file is local, then use that
+            local_idx = None
+            for suf in self.IDX_SUFFIX:
+                idx_path = local_grib.with_suffix(suf)
+                if idx_path.exists():
+                    local_idx = idx_path
+                    break
+            return local_grib, local_idx, "local"
 
         # If priority list is set, we want to search SOURCES in that
         # priority order. If priority is None, then search all SOURCES
@@ -445,63 +437,29 @@ class Herbie:
                 key: self.SOURCES[key] for key in self.priority if key in self.SOURCES
             }
 
-        # Ok, NOW we are ready to search for the remote GRIB2 files...
+        # Search the remote sources
         for source in self.SOURCES:
             if "pando" in source:
-                # Sometimes pando returns a bad handshake. Pinging
-                # pando first can help prevent that.
                 self._ping_pando()
 
-            # Get the file URL for the source and determine if the
-            # GRIB2 file and the index file exist. If found, store the
-            # URL for the GRIB2 file and the .idx file.
             grib_url = self.SOURCES[source]
 
             if source.startswith("local"):
                 grib_path = Path(grib_url)
                 if grib_path.exists():
-                    return (grib_path, source)
-            elif self._check_grib(grib_url):
-                return (grib_url, source)
-
-        return (None, None)
-
-    def find_idx(self) -> tuple[Optional[Union[Path, str]], Optional[str]]:
-        """Find an index file for the GRIB file."""
-        # If priority list is set, we want to search SOURCES in that
-        # priority order. If priority is None, then search all SOURCES
-        # in the order given by the model template file.
-        # NOTE: A source from the template will not be used if it is not
-        # included in the priority list.
-        if self.priority is not None:
-            self.SOURCES = {
-                key: self.SOURCES[key] for key in self.priority if key in self.SOURCES
-            }
-
-        # Ok, NOW we are ready to search for the remote GRIB2 files...
-        for source in self.SOURCES:
-            if "pando" in source:
-                # Sometimes pando returns a bad handshake. Pinging
-                # pando first can help prevent that.
-                self._ping_pando()
-
-            # Get the file URL for the source and determine if the
-            # GRIB2 file and the index file exist. If found, store the
-            # URL for the GRIB2 file and the .idx file.
-            grib_url = self.SOURCES[source]
-
-            if source.startswith("local"):
-                local_grib = Path(grib_url)
-                local_idx = local_grib.with_suffix(self.IDX_SUFFIX[0])
-                if local_idx.exists():
-                    return (local_idx, "local")
+                    idx_path = None
+                    for suf in self.IDX_SUFFIX:
+                        p = grib_path.with_suffix(suf)
+                        if p.exists():
+                            idx_path = p
+                            break
+                    return grib_path, idx_path, source
             else:
-                idx_exists, idx_url = self._check_idx(grib_url)
+                grib_ok, idx_url = self._check_grib(grib_url)
+                if grib_ok:
+                    return grib_url, idx_url, source
 
-                if idx_exists:
-                    return (idx_url, source)
-
-        return (None, None)
+        return None, None, None
 
     @property
     def get_remoteFileName(self, source: Optional[str] = None) -> str:
@@ -1006,8 +964,8 @@ class Herbie:
 
         if self.overwrite and self.grib_source.startswith("local"):
             # Search for the grib files on the remote archives again
-            self.grib, self.grib_source = self.find_grib(overwrite=True)
-            self.idx, self.idx_source = self.find_idx()
+            self.grib, self.idx, self.grib_source = self.find_grib()
+            self.idx_source = self.grib_source
             print(f"Overwrite local file with file from [{self.grib_source}]")
 
         # Check that data exists
